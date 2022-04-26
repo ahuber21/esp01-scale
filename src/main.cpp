@@ -16,8 +16,10 @@ static const int led_pin = 2; // GPIO2
 HX711 scale;
 static const int scale_dout_pin = 3; // GPIO2
 static const int scale_sck_pin = 1;  // GPIO0
-static const long scale_offset = 50682624;
-static const long scale_divider = 5895655;
+// static const long scale_offset = 50682624;
+// static const long scale_divider = 5895655;
+static const long scale_offset = 0;
+static const long scale_divider = 0;
 
 // mqtt
 #define MOSQUITTO_PORT 1883
@@ -47,6 +49,9 @@ void setup_wifi();
 void setup_ota();
 void setup_mqtt();
 
+// scale helpers
+void read_and_report_scale();
+
 void setup()
 {
   pinMode(led_pin, OUTPUT);
@@ -57,8 +62,8 @@ void setup()
   setup_serial();
   setup_wifi();
   setup_ota();
-  setup_hx711();
   setup_mqtt();
+  setup_hx711();
 
   ticker.detach();
   signal_setup_complete();
@@ -75,18 +80,7 @@ void loop()
   }
   mqtt_client.loop();
 
-  if (scale.wait_ready_timeout(1000))
-  {
-    long reading = scale.get_units(10);
-    mqtt_client.publish("scale/out/w", std::to_string(reading).c_str());
-  }
-  else
-  {
-    Serial.println("HX711 not found.");
-    mqtt_client.publish("scale/out/e", "HX711 not found");
-  }
-
-  delay(2000);
+  read_and_report_scale();
 }
 
 void setup_serial()
@@ -154,7 +148,7 @@ void mqtt_connect()
     if (mqtt_client.connect(mqtt_clientid))
     {
       Serial.println("connected");
-      mqtt_client.publish("scale/out/status", "scale ready");
+      mqtt_client.publish("scale/out/status", "scale online");
       // ... and resubscribe
       mqtt_client.subscribe(mqtt_in_topic);
     }
@@ -188,4 +182,17 @@ void signal_setup_complete()
 {
   // LED remains during normal operation
   digitalWrite(led_pin, HIGH);
+}
+
+void read_and_report_scale()
+{
+  if (scale.wait_ready_timeout(200))
+  {
+    long reading = scale.read();
+    mqtt_client.publish("scale/out/w", std::to_string(reading).c_str());
+  }
+  else
+  {
+    mqtt_client.publish("scale/out/e", "HX711 not found");
+  }
 }

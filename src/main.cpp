@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <Credentials.h>
+#include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <HX711.h>
 #include <PubSubClient.h>
@@ -10,16 +11,12 @@
 // follows the guide on https://honey-pi.de/en/4x-half-bridge-waegezellen/
 
 // status LED
-static const int led_pin = 2; // GPIO2
+static const int led_pin = 2;
 
 // the scale's ADC
 HX711 scale;
-static const int scale_dout_pin = 3; // GPIO2
-static const int scale_sck_pin = 1;  // GPIO0
-// static const long scale_offset = 50682624;
-// static const long scale_divider = 5895655;
-static const long scale_offset = 0;
-static const long scale_divider = 0;
+static const int scale_dout_pin = 3;
+static const int scale_sck_pin = 0;
 
 // mqtt
 #define MOSQUITTO_PORT 1883
@@ -34,6 +31,8 @@ WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 void mqtt_callback(char *topic, byte *payload, uint16_t length);
 void mqtt_connect();
+int16_t get_number_in_message(const char *message);
+double get_double_in_message(const char *message);
 
 // ticker for timed callbacks, e.g. blinking leds
 Ticker ticker;
@@ -50,7 +49,11 @@ void setup_ota();
 void setup_mqtt();
 
 // scale helpers
-void read_and_report_scale();
+void scale_read_and_report();
+void scale_calibrate(float cal_weight_grams, float tolerance = 20);
+
+// EEPROM helpers - values have hardcoded addresses
+static const int16_t scale_calibration_address = 0x00;
 
 void setup()
 {
@@ -59,6 +62,7 @@ void setup()
 
   ticker.attach_ms(100, blink_red_led);
 
+  EEPROM.begin(sizeof(float));
   setup_serial();
   setup_wifi();
   setup_ota();
@@ -80,7 +84,7 @@ void loop()
   }
   mqtt_client.loop();
 
-  read_and_report_scale();
+  scale_read_and_report();
 }
 
 void setup_serial()
@@ -116,10 +120,13 @@ void setup_ota()
 
 void setup_hx711()
 {
-  scale.begin(scale_dout_pin, scale_sck_pin);
+  scale.begin(scale_dout_pin, scale_sck_pin, 64);
 
-  scale.set_scale(scale_divider);
-  scale.set_offset(scale_offset);
+  float calibration;
+  EEPROM.get(scale_calibration_address, calibration);
+  mqtt_client.publish("scale/out/d", ("Loaded calibration factor = " + std::to_string(calibration)).c_str());
+  scale.set_scale(calibration);
+  scale.tare();
 }
 
 void setup_mqtt()
@@ -131,7 +138,36 @@ void setup_mqtt()
 
 void mqtt_callback(char *topic, byte *payload, uint16_t length)
 {
-  Serial.println("MQTT callback");
+  char message[length + 1];
+  for (uint16_t i = 0; i < length; ++i)
+  {
+    message[i] = payload[i];
+  }
+  message[length] = '\0';
+
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println(message);
+
+  if (strncmp(message, "CALIBRATE", 9) == 0)
+  {
+    float weight = get_double_in_message(message);
+    if (weight > 1)
+    {
+      scale_calibrate(weight, 0.03 * weight); // 3 % tolerance
+    }
+    else
+      mqtt_client.publish("scale/out/d", "Bad calibration weight");
+  }
+  else if (strcmp(message, "TARE") == 0)
+  {
+    scale.tare(3);
+  }
+  else
+  {
+    mqtt_client.publish("scale/out/e", "Didn't understand message");
+  }
 }
 
 void mqtt_connect()
@@ -150,14 +186,14 @@ void mqtt_connect()
       Serial.println("connected");
       mqtt_client.publish("scale/out/status", "scale online");
       // ... and resubscribe
-      mqtt_client.subscribe(mqtt_in_topic);
+      mqtt_client.subscribe(mqtt_in_topic, 0);
     }
     else
     {
       Serial.print("failed, rc=");
       Serial.println(mqtt_client.state());
-      // Wait 5 seconds before retrying
-      delay(1000);
+      delay(5000);
+      ESP.restart();
     }
   }
 }
@@ -184,15 +220,104 @@ void signal_setup_complete()
   digitalWrite(led_pin, HIGH);
 }
 
-void read_and_report_scale()
+void scale_read_and_report()
 {
-  if (scale.wait_ready_timeout(200))
+  long reading = scale.get_value(4);
+  float grams = scale.get_units(4);
+  mqtt_client.publish("scale/out/raw", std::to_string(reading).c_str());
+  mqtt_client.publish("scale/out/g", std::to_string(grams).c_str());
+  mqtt_client.publish("scale/out/kg", std::to_string(grams / 1000.f).c_str());
+}
+
+void scale_calibrate(float cal_weight_grams, float tolerance)
+{
+  float orig_scale = scale.get_scale();
+
+  float units;
+  float start_units = scale.get_units(3);
+
+  uint32_t timerStart = millis();
+  while (abs((units = scale.get_units(3)) - start_units) < 0.5 * cal_weight_grams)
   {
-    long reading = scale.read();
-    mqtt_client.publish("scale/out/w", std::to_string(reading).c_str());
+    mqtt_client.publish("scale/out/d", ("Place calibration weight - " + std::to_string(cal_weight_grams) + " grams").c_str());
+    if ((millis() - timerStart) > 10 * 1000)
+    {
+      mqtt_client.publish("scale/out/e", "Calibration timed out");
+      return;
+    }
+    delay(500);
+  }
+
+  uint8_t cal_success = 0;
+  float calib;
+  float step = 2;
+  float value = scale.get_value(3);
+  float guess = cal_weight_grams / abs(value);
+
+  for (int i = 1; i <= 50; ++i)
+  {
+    scale.set_scale(guess);
+    units = scale.get_units(i > 4 ? 10 : 4);
+    mqtt_client.publish("scale/out/d", ("Optimising | units = " + std::to_string(units) + " | guess = " + std::to_string(guess)).c_str());
+
+    if (abs(units - cal_weight_grams) < tolerance)
+    {
+      mqtt_client.publish("scale/out/d", "Success");
+      cal_success++;
+      calib = guess;
+      step /= 5.0f;
+      if (cal_success > 3)
+        break;
+    }
+    else
+    {
+      if (i % 4 == 0)
+        step /= 2.0f;
+
+      if (cal_weight_grams > units)
+        guess = guess < step ? guess / 5.f : guess - step;
+      else
+        guess += step;
+    }
+  }
+
+  // store to EEPROM
+  if (cal_success)
+  {
+    EEPROM.put(scale_calibration_address, calib);
+    if (EEPROM.commit())
+      mqtt_client.publish("scale/out/d", "Stored calibration to EEPROM");
+    else
+    {
+      mqtt_client.publish("scale/out/e", "Saving to EEPROM failed!");
+    }
+  }
+  else
+    scale.set_scale(orig_scale);
+}
+
+int16_t get_number_in_message(const char *message)
+{
+  const char *ptr = strchr(message, ' ');
+  if (ptr && *(ptr + 1))
+  {
+    return std::atoi(ptr + 1);
   }
   else
   {
-    mqtt_client.publish("scale/out/e", "HX711 not found");
+    return 0;
+  }
+}
+
+double get_double_in_message(const char *message)
+{
+  const char *ptr = strchr(message, ' ');
+  if (ptr && *(ptr + 1))
+  {
+    return std::atof(ptr + 1);
+  }
+  else
+  {
+    return 0.0f;
   }
 }

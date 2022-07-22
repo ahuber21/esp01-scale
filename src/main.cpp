@@ -21,8 +21,8 @@ static const int scale_sck_pin = 0;
 // mqtt
 #define MOSQUITTO_PORT 1883
 static const char *mqtt_server = "192.168.0.162";
-static const char *mqtt_clientid = "scale";
-static const char *mqtt_in_topic = "scale/in";
+static const char *mqtt_clientid = "scale1";
+static const char *mqtt_in_topic = "scale1/in";
 
 // wifi client
 WiFiClient espClient;
@@ -51,6 +51,7 @@ void setup_mqtt();
 // scale helpers
 void scale_read_and_report();
 void scale_calibrate(float cal_weight_grams, float tolerance = 20);
+float last_grams = 0;
 
 // EEPROM helpers - values have hardcoded addresses
 static const int16_t scale_calibration_address = 0x00;
@@ -124,7 +125,15 @@ void setup_hx711()
 
   float calibration;
   EEPROM.get(scale_calibration_address, calibration);
-  mqtt_client.publish("scale/out/d", ("Loaded calibration factor = " + std::to_string(calibration)).c_str());
+  if (calibration != calibration)
+  {
+    mqtt_client.publish("scale/out/d", "Loaded calibration factor is NaN - resetting to 1 ");
+    calibration = 1;
+  }
+  else
+  {
+    mqtt_client.publish("scale/out/d", ("Loaded calibration factor = " + std::to_string(calibration)).c_str());
+  }
   scale.set_scale(calibration);
   scale.tare();
 }
@@ -155,7 +164,7 @@ void mqtt_callback(char *topic, byte *payload, uint16_t length)
     float weight = get_double_in_message(message);
     if (weight > 1)
     {
-      scale_calibrate(weight, 0.03 * weight); // 3 % tolerance
+      scale_calibrate(weight, 0.01 * weight); // 3 % tolerance
     }
     else
       mqtt_client.publish("scale/out/d", "Bad calibration weight");
@@ -222,15 +231,27 @@ void signal_setup_complete()
 
 void scale_read_and_report()
 {
-  long reading = scale.get_value(4);
+  // fast value to see if we're changin
   float grams = scale.get_units(4);
-  mqtt_client.publish("scale/out/raw", std::to_string(reading).c_str());
-  mqtt_client.publish("scale/out/g", std::to_string(grams).c_str());
+  if ((grams < 20) || (abs(grams - last_grams) / (grams + last_grams) > 0.9))
+  {
+    // changed by less than 10 % -> more accurate reading pls
+    grams = scale.get_units(20);
+    mqtt_client.publish("scale/out/d", "slow read");
+  }
+  else
+  {
+    mqtt_client.publish("scale/out/d", "fast read");
+  }
   mqtt_client.publish("scale/out/kg", std::to_string(grams / 1000.f).c_str());
 }
 
 void scale_calibrate(float cal_weight_grams, float tolerance)
 {
+  // start to zero grams
+  scale.tare();
+
+  // get the original scale value
   float orig_scale = scale.get_scale();
 
   float units;
@@ -251,13 +272,17 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
   uint8_t cal_success = 0;
   float calib;
   float step = 2;
-  float value = scale.get_value(3);
+  float value = scale.get_value(5);
   float guess = cal_weight_grams / abs(value);
+
+  bool increasing_guess = true;
+  bool decreasing_guess = false;
+  uint8_t sign_flip_count = 0;
 
   for (int i = 1; i <= 50; ++i)
   {
     scale.set_scale(guess);
-    units = scale.get_units(i > 4 ? 10 : 4);
+    units = scale.get_units(i > 4 ? 15 : 8);
     mqtt_client.publish("scale/out/d", ("Optimising | units = " + std::to_string(units) + " | guess = " + std::to_string(guess)).c_str());
 
     if (abs(units - cal_weight_grams) < tolerance)
@@ -271,13 +296,34 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
     }
     else
     {
-      if (i % 4 == 0)
-        step /= 2.0f;
-
+      if (sign_flip_count == 3)
+      {
+        step = 0.9 * step;
+        sign_flip_count = 0;
+        mqtt_client.publish("scale/out/d", ("sign flip detected | decreasing step to " + std::to_string(step)).c_str());
+      }
       if (cal_weight_grams > units)
+      {
         guess = guess < step ? guess / 5.f : guess - step;
+        mqtt_client.publish("scale/out/d", "undershoot");
+        if (increasing_guess)
+        {
+          ++sign_flip_count;
+          increasing_guess = false;
+          decreasing_guess = true;
+        }
+      }
       else
+      {
         guess += step;
+        mqtt_client.publish("scale/out/d", "overshoot");
+        if (decreasing_guess)
+        {
+          ++sign_flip_count;
+          decreasing_guess = false;
+          increasing_guess = true;
+        }
+      }
     }
   }
 

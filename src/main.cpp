@@ -23,6 +23,9 @@ static const int scale_sck_pin = 0;
 static const char *mqtt_server = "192.168.0.162";
 static const char *mqtt_clientid = "scale1";
 static const char *mqtt_in_topic = "scale1/in";
+static const char *mqtt_out_e = "scale1/out/e";
+static const char *mqtt_out_d = "scale1/out/d";
+static const char *mqtt_out_kg = "scale1/out/kg";
 
 // wifi client
 WiFiClient espClient;
@@ -52,9 +55,13 @@ void setup_mqtt();
 void scale_read_and_report();
 void scale_calibrate(float cal_weight_grams, float tolerance = 20);
 float last_grams = 0;
+uint8_t nreads = 4;
 
 // EEPROM helpers - values have hardcoded addresses
 static const int16_t scale_calibration_address = 0x00;
+
+// report helpers
+void report_ip();
 
 void setup()
 {
@@ -127,12 +134,12 @@ void setup_hx711()
   EEPROM.get(scale_calibration_address, calibration);
   if (calibration != calibration)
   {
-    mqtt_client.publish("scale/out/d", "Loaded calibration factor is NaN - resetting to 1 ");
+    mqtt_client.publish(mqtt_out_d, "Loaded calibration factor is NaN - resetting to 1 ");
     calibration = 1;
   }
   else
   {
-    mqtt_client.publish("scale/out/d", ("Loaded calibration factor = " + std::to_string(calibration)).c_str());
+    mqtt_client.publish(mqtt_out_d, ("Loaded calibration factor = " + std::to_string(calibration)).c_str());
   }
   scale.set_scale(calibration);
   scale.tare();
@@ -167,15 +174,24 @@ void mqtt_callback(char *topic, byte *payload, uint16_t length)
       scale_calibrate(weight, 0.01 * weight); // 3 % tolerance
     }
     else
-      mqtt_client.publish("scale/out/d", "Bad calibration weight");
+      mqtt_client.publish(mqtt_out_d, "Bad calibration weight");
   }
   else if (strcmp(message, "TARE") == 0)
   {
     scale.tare(3);
   }
+  else if (strncmp(message, "NREADS", 6) == 0)
+  {
+    nreads = get_number_in_message(message);
+    mqtt_client.publish(mqtt_out_d, ("New nreads = " + std::to_string(nreads)).c_str());
+  }
+  else if (strcmp(message, "IP") == 0)
+  {
+    report_ip();
+  }
   else
   {
-    mqtt_client.publish("scale/out/e", "Didn't understand message");
+    mqtt_client.publish(mqtt_out_e, "Didn't understand message");
   }
 }
 
@@ -193,7 +209,7 @@ void mqtt_connect()
     if (mqtt_client.connect(mqtt_clientid))
     {
       Serial.println("connected");
-      mqtt_client.publish("scale/out/status", "scale online");
+      report_ip();
       // ... and resubscribe
       mqtt_client.subscribe(mqtt_in_topic, 0);
     }
@@ -205,6 +221,14 @@ void mqtt_connect()
       ESP.restart();
     }
   }
+}
+
+void report_ip()
+{
+  char buf[18];
+  String s = WiFi.localIP().toString();
+  s.toCharArray(buf, 18);
+  mqtt_client.publish(mqtt_out_d, buf);
 }
 
 void blink_red_led()
@@ -232,18 +256,8 @@ void signal_setup_complete()
 void scale_read_and_report()
 {
   // fast value to see if we're changin
-  float grams = scale.get_units(4);
-  if ((grams < 20) || (abs(grams - last_grams) / (grams + last_grams) > 0.9))
-  {
-    // changed by less than 10 % -> more accurate reading pls
-    grams = scale.get_units(20);
-    mqtt_client.publish("scale/out/d", "slow read");
-  }
-  else
-  {
-    mqtt_client.publish("scale/out/d", "fast read");
-  }
-  mqtt_client.publish("scale/out/kg", std::to_string(grams / 1000.f).c_str());
+  float grams = scale.get_units(nreads);
+  mqtt_client.publish(mqtt_out_kg, std::to_string(grams / 1000.f).c_str());
 }
 
 void scale_calibrate(float cal_weight_grams, float tolerance)
@@ -260,10 +274,10 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
   uint32_t timerStart = millis();
   while (abs((units = scale.get_units(3)) - start_units) < 0.5 * cal_weight_grams)
   {
-    mqtt_client.publish("scale/out/d", ("Place calibration weight - " + std::to_string(cal_weight_grams) + " grams").c_str());
+    mqtt_client.publish(mqtt_out_d, ("Place calibration weight - " + std::to_string(cal_weight_grams) + " grams").c_str());
     if ((millis() - timerStart) > 10 * 1000)
     {
-      mqtt_client.publish("scale/out/e", "Calibration timed out");
+      mqtt_client.publish(mqtt_out_e, "Calibration timed out");
       return;
     }
     delay(500);
@@ -283,11 +297,11 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
   {
     scale.set_scale(guess);
     units = scale.get_units(i > 4 ? 15 : 8);
-    mqtt_client.publish("scale/out/d", ("Optimising | units = " + std::to_string(units) + " | guess = " + std::to_string(guess)).c_str());
+    mqtt_client.publish(mqtt_out_d, ("Optimising | units = " + std::to_string(units) + " | guess = " + std::to_string(guess)).c_str());
 
     if (abs(units - cal_weight_grams) < tolerance)
     {
-      mqtt_client.publish("scale/out/d", "Success");
+      mqtt_client.publish(mqtt_out_d, "Success");
       cal_success++;
       calib = guess;
       step /= 5.0f;
@@ -300,12 +314,12 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
       {
         step = 0.9 * step;
         sign_flip_count = 0;
-        mqtt_client.publish("scale/out/d", ("sign flip detected | decreasing step to " + std::to_string(step)).c_str());
+        mqtt_client.publish(mqtt_out_d, ("sign flip detected | decreasing step to " + std::to_string(step)).c_str());
       }
       if (cal_weight_grams > units)
       {
         guess = guess < step ? guess / 5.f : guess - step;
-        mqtt_client.publish("scale/out/d", "undershoot");
+        mqtt_client.publish(mqtt_out_d, "undershoot");
         if (increasing_guess)
         {
           ++sign_flip_count;
@@ -316,7 +330,7 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
       else
       {
         guess += step;
-        mqtt_client.publish("scale/out/d", "overshoot");
+        mqtt_client.publish(mqtt_out_d, "overshoot");
         if (decreasing_guess)
         {
           ++sign_flip_count;
@@ -332,10 +346,10 @@ void scale_calibrate(float cal_weight_grams, float tolerance)
   {
     EEPROM.put(scale_calibration_address, calib);
     if (EEPROM.commit())
-      mqtt_client.publish("scale/out/d", "Stored calibration to EEPROM");
+      mqtt_client.publish(mqtt_out_d, "Stored calibration to EEPROM");
     else
     {
-      mqtt_client.publish("scale/out/e", "Saving to EEPROM failed!");
+      mqtt_client.publish(mqtt_out_e, "Saving to EEPROM failed!");
     }
   }
   else
